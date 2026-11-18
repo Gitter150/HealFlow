@@ -1,5 +1,7 @@
 # Welcome to your Lovable project
 
+HealFlow's backend setup, offline tests, and OOAD design pattern locations are documented in the [backend README](Backend/README.md).
+
 ## Project info
 
 **URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID

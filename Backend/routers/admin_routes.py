@@ -1,4 +1,6 @@
-from fastapi import APIRouter, HTTPException
+from repositories.appointment_actions import PostgresAppointmentActionRepository
+from services.appointment_actions import AdminAppointmentActions, InvalidAppointmentAction
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 import psycopg2
@@ -14,6 +16,11 @@ router = APIRouter(prefix="/api/admin", tags=["Admin Dashboard"])
 
 def get_db_connection():
     return psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+
+def get_action_service():
+    return AdminAppointmentActions(PostgresAppointmentActionRepository(get_db_connection))
 
 # ==========================================
 # 1. FETCH ALL APPOINTMENTS FOR THE ADMIN
@@ -78,45 +85,15 @@ class AdminAction(BaseModel):
     action: str # "confirm", "double_book", or "dismiss"
 
 @router.put("/appointments/{appointment_id}/action")
-def handle_appointment_action(appointment_id: int, request: AdminAction):
-    conn = None
-    cursor = None
+def handle_appointment_action(appointment_id: int, request: AdminAction,
+                              service: AdminAppointmentActions = Depends(get_action_service)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        if request.action == "confirm":
-            query = "UPDATE appointments SET status = 'confirmed', is_overbooked = FALSE WHERE appointment_id = %s"
-            message = "Appointment locked and confirmed."
-            
-        elif request.action == "double_book":
-            query = "UPDATE appointments SET is_overbooked = TRUE WHERE appointment_id = %s"
-            message = "Slot marked for double booking. Patient remains scheduled."
-            
-        elif request.action == "dismiss":
-            # --- NEW: Dismiss the patient and trigger the warning ---
-            query = "UPDATE appointments SET status = 'reschedule_requested' WHERE appointment_id = %s"
-            message = "Patient dismissed. Warning sent to their dashboard."
-            
-        else:
-            raise HTTPException(status_code=400, detail="Invalid action.")
-            
-        cursor.execute(query, (appointment_id,))
-        conn.commit()
-        
+        message = service.execute(appointment_id, request.action)
         return {"status": "success", "message": message}
-
-    except Exception as e:
-        print(f"🔥 ADMIN BUTTON ERROR: {e}")
-        
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail="Failed to update appointment")
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+    except InvalidAppointmentAction as exc:
+        raise HTTPException(status_code=400, detail="Invalid action.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to update appointment") from exc
 
 # ==========================================
 # 3. GLOBAL HOSPITAL RECORDS (SEARCH BY NAME)

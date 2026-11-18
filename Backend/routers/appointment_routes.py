@@ -1,17 +1,22 @@
-from fastapi import APIRouter, HTTPException, File, Form, UploadFile
+from repositories.appointment_actions import PostgresAppointmentActionRepository
+from services.appointment_actions import ClinicalAppointmentActions, InvalidAppointmentAction
+from fastapi import APIRouter, HTTPException, File, Form, UploadFile, Depends
 from pydantic import BaseModel
 from typing import Optional
 import psycopg2
 import psycopg2.extras
 import os
-import joblib  # ML Brain
-import numpy as np  # ML Math
 from dotenv import load_dotenv
 from datetime import datetime
 from optimizer import ScheduleOptimizer
 
 # Import Phase 2 Triage Logic
-from triage_engine import extract_text, calculate_dynamic_priority
+from domain.appointment import Appointment
+from repositories.appointments import PostgresAppointmentRepository
+from services.booking import BookingService
+from services.prediction import load_booking_predictor
+from services.triage import TriageEngine
+from functools import lru_cache
 
 # Import Phase 5 Simulator
 from monte_carlo import MonteCarloSimulator
@@ -21,53 +26,35 @@ DB_URL = os.getenv("DATABASE_URL")
 
 router = APIRouter(prefix="/api/appointments", tags=["Appointment Scheduling"])
 
-# ==========================================
-# 1. INTEGRATED AI BRAIN (PHASE 3)
-# ==========================================
-try:
-    model = joblib.load('noshow_model.pkl')
-    scaler = joblib.load('scaler.pkl')
-    print("✅ ML Intelligence integrated into Appointment Routes!")
-except Exception as e:
-    print(f"⚠️ ML Integration Warning: Models not found. Using default 0.0 risk. Error: {e}")
-    model = None
-    scaler = None
+@lru_cache(maxsize=1)
+def get_booking_predictor():
+    return load_booking_predictor()
+
+
+def get_booking_service() -> BookingService:
+    repository = PostgresAppointmentRepository(get_db_connection)
+    return BookingService(repository.transaction, get_booking_predictor(), TriageEngine())
+
 
 def get_db_connection():
     return psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
+
+
+def get_action_service():
+    return ClinicalAppointmentActions(PostgresAppointmentActionRepository(get_db_connection))
+
 # ==========================================
 # PHASE 4: LIVE PRIORITY QUEUE & RECEPTIONIST (GLOBAL/ADMIN)
 # ==========================================
 @router.put("/{appointment_id}/arrive")
-def mark_patient_arrived(appointment_id: int):
-    """Marks a patient as physically present using exact server time."""
-    conn = None
-    cursor = None
+def mark_patient_arrived(appointment_id: int, service: ClinicalAppointmentActions = Depends(get_action_service)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # 1. Grab the exact local time from Python to avoid DB timezone offsets
-        exact_now = datetime.now()
-        
-        # 2. Pass it directly to the database
-        query = """
-            UPDATE appointments 
-            SET status = 'entered_hospital', entry_time = %s
-            WHERE appointment_id = %s
-        """
-        cursor.execute(query, (exact_now, appointment_id))
-        conn.commit()
-        
-        return {"status": "success", "message": "Patient marked as arrived."}
-    except Exception as e:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
+        message = service.execute(appointment_id, "arrive")
+        return {"status": "success", "message": message}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/live-queue")
@@ -148,28 +135,13 @@ class AppointmentCreate(BaseModel):
     no_show_risk: float = 0.0
 
 @router.post("/book")
-def book_appointment(data: AppointmentCreate):
-    conn = None
-    cursor = None
+def book_appointment(data: AppointmentCreate,
+                     service: BookingService = Depends(get_booking_service)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        query = """
-            INSERT INTO appointments (patient_id, doctor_id, appointment_time, status, priority_score, no_show_risk)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING appointment_id;
-        """
-        cursor.execute(query, (data.patient_id, data.doctor_id, data.appointment_time, data.status, data.priority_score, data.no_show_risk))
-        result = cursor.fetchone()
-        conn.commit()
-        return {"status": "success", "appointment_id": result['appointment_id'] if result else None}
-    except Exception as e:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail="Failed to book")
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
+        appointment = service.book(Appointment(**data.model_dump()))
+        return {"status": "success", "appointment_id": appointment.appointment_id}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to book") from exc
 
 # ==========================================
 # PHASE 2 & 3: INTELLIGENT TRIAGE BOOKING ROUTE
@@ -180,150 +152,54 @@ async def book_appointment_triage(
     doctor_id: str = Form(...),
     appointment_time: str = Form(...),
     current_symptom: str = Form(...),
-    file: Optional[UploadFile] = File(None) 
+    file: Optional[UploadFile] = File(None),
+    service: BookingService = Depends(get_booking_service),
 ):
-    conn = None
-    cursor = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # --- STEP 1: OCR Processing (Phase 2) ---
-        extracted_text = ""
-        if file:
-            file_bytes = await file.read()
-            extracted_text = extract_text(file_bytes, file.filename)
-            
-        # --- STEP 2: Priority Calculation (Phase 2) ---
-        final_priority = calculate_dynamic_priority(current_symptom, extracted_text)
-        
-        # --- STEP 3: DYNAMIC NO-SHOW PREDICTION (PHASE 3) ---
-        no_show_risk_percentage = 0.0
-        
-        if model and scaler:
-            try:
-                # A. Calculate Lead Time Days
-                apt_date = datetime.strptime(appointment_time[:16], "%Y-%m-%d %H:%M")
-                lead_time_days = (apt_date - datetime.now()).days
-                lead_time_days = max(0, lead_time_days)
-
-                # B. Fetch Patient Profile (Age, Distance, History)
-                metrics_query = """
-                    SELECT age, distance_miles,
-                    (SELECT COUNT(*) FROM appointments WHERE patient_id = %s AND status IN ('No-Show', 'no_show', 'No Show')) as history
-                    FROM patient_profiles WHERE uid = %s;
-                """
-                cursor.execute(metrics_query, (patient_id, patient_id))
-                m = cursor.fetchone()
-
-                # C. Run AI Prediction if they have a complete profile
-                if m and m['age'] is not None and m['distance_miles'] is not None:
-                    features = np.array([[m['age'], m['distance_miles'], lead_time_days, m['history']]])
-                    features_scaled = scaler.transform(features)
-                    no_show_risk_percentage = float(round(model.predict_proba(features_scaled)[0][0] * 100, 2))
-            except Exception as ml_err:
-                print(f"Prediction skipped/error: {ml_err}")
-
-        # --- STEP 4: Insert Final Appointment ---
-        query = """
-            INSERT INTO appointments (patient_id, doctor_id, appointment_time, status, priority_score, no_show_risk)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING appointment_id;
-        """
-        cursor.execute(query, (patient_id, doctor_id, appointment_time, "scheduled", final_priority, no_show_risk_percentage))
-        result = cursor.fetchone()
-        conn.commit()
-        
+        content = await file.read() if file else None
+        appointment = service.book_with_triage(
+            patient_id, doctor_id, appointment_time, current_symptom,
+            content, (file.filename or "") if file else "",
+        )
         return {
-            "status": "success", 
-            "appointment_id": result['appointment_id'] if result else None,
-            "assigned_priority": final_priority,
-            "message": f"Appointment booked successfully."
+            "status": "success",
+            "appointment_id": appointment.appointment_id,
+            "assigned_priority": appointment.priority_score,
+            "message": "Appointment booked successfully.",
         }
-        
-    except Exception as e:
-        print(f"🔥 Error in triage booking: {e}")
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail="Failed to process triage booking.")
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to process triage booking.") from exc
 
-# ==========================================
-# CANCEL APPOINTMENT ROUTE 
-# ==========================================
+
 @router.put("/{appointment_id}/cancel")
-def cancel_appointment(appointment_id: int):
-    conn = None
-    cursor = None
+def cancel_appointment(appointment_id: int, service: ClinicalAppointmentActions = Depends(get_action_service)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        query = "UPDATE appointments SET status = 'cancelled' WHERE appointment_id = %s"
-        cursor.execute(query, (appointment_id,))
-        conn.commit()
-        
-        return {"status": "success", "message": "Appointment cancelled successfully"}
-    except Exception as e:
-        print(f"🔥 Error cancelling appointment: {e}")
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail="Failed to cancel appointment")
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
+        message = service.execute(appointment_id, "cancel")
+        return {"status": "success", "message": message}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to cancel appointment") from exc
 
 # ==========================================
 # PHASE 7: CALL PATIENT ROUTE (Doctor Dashboard)
 # ==========================================
 @router.put("/{appointment_id}/consult")
-def consult_appointment(appointment_id: int):
-    """Marks an appointment as 'in_consultation', pulling them from the waiting room."""
-    conn = None
-    cursor = None
+def consult_appointment(appointment_id: int, service: ClinicalAppointmentActions = Depends(get_action_service)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Update the status to 'in_consultation'
-        query = "UPDATE appointments SET status = 'in_consultation' WHERE appointment_id = %s"
-        cursor.execute(query, (appointment_id,))
-        conn.commit()
-        
-        return {"status": "success", "message": "Patient moved to consultation!"}
-    except Exception as e:
-        print(f"🔥 Error calling patient: {e}")
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail="Failed to call patient")
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
+        message = service.execute(appointment_id, "consult")
+        return {"status": "success", "message": message}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to call patient") from exc
 
 # ==========================================
 # COMPLETE APPOINTMENT ROUTE (Doctor Dashboard)
 # ==========================================
 @router.put("/{appointment_id}/complete")
-def complete_appointment(appointment_id: int):
-    """Marks an appointment as completed from the Doctor Dashboard."""
-    conn = None
-    cursor = None
+def complete_appointment(appointment_id: int, service: ClinicalAppointmentActions = Depends(get_action_service)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Update the status to 'completed'
-        query = "UPDATE appointments SET status = 'completed' WHERE appointment_id = %s"
-        cursor.execute(query, (appointment_id,))
-        conn.commit()
-        
-        return {"status": "success", "message": "Appointment marked as completed!"}
-    except Exception as e:
-        print(f"🔥 Error completing appointment: {e}")
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail="Failed to complete appointment")
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
+        message = service.execute(appointment_id, "complete")
+        return {"status": "success", "message": message}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to complete appointment") from exc
 
 # ==========================================
 # UPDATE APPOINTMENT STATUS (Admin Confirm/Reschedule)
@@ -332,24 +208,13 @@ class UpdateStatusRequest(BaseModel):
     status: str
 
 @router.put("/{appointment_id}/status")
-def update_appointment_status(appointment_id: int, request: UpdateStatusRequest):
-    conn = None
-    cursor = None
+def update_appointment_status(appointment_id: int, request: UpdateStatusRequest,
+                              service: ClinicalAppointmentActions = Depends(get_action_service)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        query = "UPDATE appointments SET status = %s WHERE appointment_id = %s"
-        cursor.execute(query, (request.status, appointment_id))
-        conn.commit()
-        
-        return {"status": "success", "message": f"Status updated to {request.status}"}
-    except Exception as e:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail="Failed to update status")
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
+        message = service.execute(appointment_id, "set_status", status=request.status)
+        return {"status": "success", "message": message}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to update status") from exc
 
 # ==========================================
 # GET APPOINTMENTS FOR PATIENT HISTORY TAB

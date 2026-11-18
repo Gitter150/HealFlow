@@ -3,3 +3,11 @@ uvicorn==0.27.1
 pydantic
 psycopg2-binary
 python-dotenv==1.0.1
+python-multipart
+numpy
+joblib
+scikit-learn==1.6.1
+pandas
+PyMuPDF
+pytesseract
+Pillow

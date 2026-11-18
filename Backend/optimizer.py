@@ -1,22 +1,31 @@
 import random
 import math
 import copy
+from typing import Any, Callable, TypeAlias
 from monte_carlo import MonteCarloSimulator
 
+Schedule: TypeAlias = list[dict[str, Any]]
+ScheduleScore: TypeAlias = Callable[[Schedule], float]
+
+
+def _monte_carlo_cost(schedule: Schedule) -> float:
+    """Estimate candidate cost with the existing 50-run simulation budget."""
+    simulator = MonteCarloSimulator(schedule)
+    return simulator.run_simulation(iterations=50)["total_cost"]
+
+
 class ScheduleOptimizer:
-    def __init__(self, initial_schedule, initial_temp=100.0, cooling_rate=0.95, max_iterations=100):
+    def __init__(self, initial_schedule: Schedule, initial_temp: float = 100.0,
+                 cooling_rate: float = 0.95, max_iterations: int = 100,
+                 *, score_schedule: ScheduleScore = _monte_carlo_cost):
         self.current_schedule = initial_schedule
         self.initial_temp = initial_temp
         self.cooling_rate = cooling_rate
         self.max_iterations = max_iterations
-        
-    def _evaluate_schedule(self, schedule):
-        """Runs the Phase 5 Monte Carlo engine to score this specific schedule layout."""
-        # Note: We run fewer iterations (e.g., 50) during optimization for speed, 
-        # otherwise 100 max_iterations * 1000 Monte Carlo runs = 100,000 simulations!
-        simulator = MonteCarloSimulator(schedule)
-        results = simulator.run_simulation(iterations=50) 
-        return results['total_cost']
+        self._score_schedule = score_schedule
+
+    def _evaluate_schedule(self, schedule: Schedule) -> float:
+        return self._score_schedule(schedule)
 
     def _get_neighbor_schedule(self, schedule):
         """Swaps patients OR nudges them to fix double-bookings."""

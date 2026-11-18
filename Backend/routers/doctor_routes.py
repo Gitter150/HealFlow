@@ -1,4 +1,6 @@
-from fastapi import APIRouter, HTTPException
+from repositories.appointment_actions import PostgresAppointmentActionRepository
+from services.appointment_actions import ClinicalAppointmentActions, InvalidAppointmentAction
+from fastapi import APIRouter, HTTPException, Depends
 import psycopg2
 import psycopg2.extras
 import os
@@ -11,6 +13,11 @@ router = APIRouter(prefix="/api/doctors", tags=["Doctor Dashboard"])
 
 def get_db_connection():
     return psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+
+def get_action_service():
+    return ClinicalAppointmentActions(PostgresAppointmentActionRepository(get_db_connection))
 
 # ==========================================
 # 1. FETCH APPROVED APPOINTMENTS FOR DOCTOR
@@ -54,21 +61,9 @@ def get_doctor_appointments(doctor_id: str):
 # 2. MARK APPOINTMENT AS COMPLETED
 # ==========================================
 @router.put("/appointments/{appointment_id}/complete")
-def complete_appointment(appointment_id: int):
-    conn = None
-    cursor = None
+def complete_appointment(appointment_id: int, service: ClinicalAppointmentActions = Depends(get_action_service)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        query = "UPDATE appointments SET status = 'completed', is_overbooked = FALSE WHERE appointment_id = %s"
-        cursor.execute(query, (appointment_id,))
-        conn.commit()
-        
-        return {"status": "success", "message": "Appointment marked as completed!"}
-    except Exception as e:
-        if conn: conn.rollback()
-        raise HTTPException(status_code=500, detail="Failed to complete appointment")
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
+        message = service.execute(appointment_id, "doctor_complete")
+        return {"status": "success", "message": message}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to complete appointment") from exc
