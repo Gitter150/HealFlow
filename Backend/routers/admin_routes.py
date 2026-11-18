@@ -1,5 +1,6 @@
 from repositories.appointment_actions import PostgresAppointmentActionRepository
 from services.appointment_actions import AdminAppointmentActions, InvalidAppointmentAction
+from services.users import Admin
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
@@ -88,7 +89,7 @@ class AdminAction(BaseModel):
 def handle_appointment_action(appointment_id: int, request: AdminAction,
                               service: AdminAppointmentActions = Depends(get_action_service)):
     try:
-        message = service.execute(appointment_id, request.action)
+        message = Admin().review_appointment(service, appointment_id, request.action)
         return {"status": "success", "message": message}
     except InvalidAppointmentAction as exc:
         raise HTTPException(status_code=400, detail="Invalid action.") from exc

@@ -16,6 +16,7 @@ from repositories.appointments import PostgresAppointmentRepository
 from services.booking import BookingService
 from services.prediction import load_booking_predictor
 from services.triage import TriageEngine
+from services.users import Doctor, Patient
 from functools import lru_cache
 
 # Import Phase 5 Simulator
@@ -157,8 +158,8 @@ async def book_appointment_triage(
 ):
     try:
         content = await file.read() if file else None
-        appointment = service.book_with_triage(
-            patient_id, doctor_id, appointment_time, current_symptom,
+        appointment = Patient(patient_id).book_appointment(
+            service, doctor_id, appointment_time, current_symptom,
             content, (file.filename or "") if file else "",
         )
         return {
@@ -196,7 +197,7 @@ def consult_appointment(appointment_id: int, service: ClinicalAppointmentActions
 @router.put("/{appointment_id}/complete")
 def complete_appointment(appointment_id: int, service: ClinicalAppointmentActions = Depends(get_action_service)):
     try:
-        message = service.execute(appointment_id, "complete")
+        message = Doctor().complete_appointment(service, appointment_id)
         return {"status": "success", "message": message}
     except Exception as exc:
         raise HTTPException(status_code=500, detail="Failed to complete appointment") from exc

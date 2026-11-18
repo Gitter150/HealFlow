@@ -51,3 +51,8 @@ The integrated patterns are Factory Method (admin/clinical command creators),
 Command (status, overbooking and arrival operations), and Adapter
 (`services/prediction.py`). Invalid admin actions now return the intended 400.
 The current status API remains permissive; this is not an enforced state machine.
+
+`services/users.py` implements the `User`, `Patient`, `Doctor`, and `Admin`
+workflow actors. The routes use them for triage booking, appointment completion,
+and admin review. Only booking receives an actor identifier from its existing
+request. Firebase sign-in and role permissions are separate from these objects.
